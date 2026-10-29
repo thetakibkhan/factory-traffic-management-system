@@ -20,7 +20,7 @@ export class SimulatorAdapter implements ControllerPort {
     private readonly controllerEvents: ControllerEventService,
   ) {}
 
-  async dispatch(command: SignalCommand): Promise<void> {
+  async dispatch(command: SignalCommand, junctionId: string): Promise<void> {
     const sendResult = await this.prisma.controllerCommand.updateMany({
       where: { commandId: command.commandId, status: "PENDING" },
       data: {
@@ -33,7 +33,7 @@ export class SimulatorAdapter implements ControllerPort {
     if (sendResult.count !== 1) return;
 
     const simulator = await this.prisma.controllerSimulatorState.findUnique({
-      where: { junctionId: DEFAULT_JUNCTION_CONFIG.id },
+      where: { junctionId },
     });
     if (simulator === null || simulator.health !== "ONLINE") return;
 
@@ -148,8 +148,9 @@ export class SimulatorAdapter implements ControllerPort {
   }
 
   private async submitControllerEvent(input: unknown): Promise<void> {
-    const result = await this.controllerEvents.process(ControllerEventService.parse(input));
-    if (result.dispatchCommand !== null) await this.dispatch(result.dispatchCommand);
+    const event = ControllerEventService.parse(input);
+    const result = await this.controllerEvents.process(event);
+    if (result.dispatchCommand !== null) await this.dispatch(result.dispatchCommand, event.junction_id);
   }
 }
 

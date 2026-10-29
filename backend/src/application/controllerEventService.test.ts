@@ -27,4 +27,17 @@ describe("controller event validation", () => {
     assert.throws(() => ControllerEventService.parse(event));
     assert.throws(() => ControllerEventService.parse({ ...event, actual_signals: { NORTH: "RED", SOUTH: "RED", EAST: "RED", WEST: "RED" }, extra: true }));
   });
+
+  it("accepts sensor and directional signal device status while rejecting an unspecified signal direction", () => {
+    const base = {
+      event_id: "device-status-1",
+      junction_id: "A",
+      event_type: "DEVICE_STATUS",
+      status: "OFFLINE",
+      timestamp: "2026-10-29T08:15:25Z",
+    };
+    assert.equal(ControllerEventService.parse({ ...base, device_type: "SENSOR" }).event_type, "DEVICE_STATUS");
+    assert.equal(ControllerEventService.parse({ ...base, device_type: "SIGNAL_CONTROLLER", direction: "WEST" }).event_type, "DEVICE_STATUS");
+    assert.throws(() => ControllerEventService.parse({ ...base, device_type: "SIGNAL_CONTROLLER" }));
+  });
 });

@@ -110,11 +110,11 @@ export class ControllerScheduler {
         status: "SENT",
         deadlineAt: { lte: new Date(now) },
       },
-      select: { commandId: true },
+      select: { commandId: true, junctionId: true },
     });
-    for (const { commandId } of expiredCommands) {
+    for (const { commandId, junctionId } of expiredCommands) {
       const retry = await this.controllerEvents.handleTimeout(commandId, now);
-      if (retry !== null) await this.controller.dispatch(retry);
+      if (retry !== null) await this.controller.dispatch(retry, junctionId);
     }
 
     const expiredStages = await this.prisma.junctionRuntime.findMany({
@@ -126,7 +126,7 @@ export class ControllerScheduler {
     });
     for (const { junctionId } of expiredStages) {
       const command = await this.controllerEvents.advanceDue(junctionId, now);
-      if (command !== null) await this.controller.dispatch(command);
+      if (command !== null) await this.controller.dispatch(command, junctionId);
     }
   }
 }

@@ -1,6 +1,6 @@
 import { useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { getJunctionHistory, getJunctionStatus, getSimulatorStatus, submitManualCommand, submitSensorEvent, updateSimulator } from "./api";
+import { getJunctionHistory, getJunctionStatus, getSimulatorStatus, submitDeviceStatus, submitManualCommand, submitSensorEvent, updateSimulator } from "./api";
 import { nextSequence } from "./sequence";
 import type { Direction, JunctionStatus, Phase, SignalColor, SimulatorStatus, VehicleType } from "./types";
 
@@ -51,6 +51,13 @@ export default function App() {
     mutationFn: updateSimulator,
     onSuccess: () => {
       setNotice("Simulator settings updated.");
+      refreshDashboard(queryClient);
+    },
+  });
+  const deviceMutation = useMutation({
+    mutationFn: submitDeviceStatus,
+    onSuccess: () => {
+      setNotice("Device health report recorded.");
       refreshDashboard(queryClient);
     },
   });
@@ -121,9 +128,16 @@ export default function App() {
           <section className="summary-grid" aria-label="Junction summary">
             <SummaryCard label="Operating mode" value={humanize(status.mode)} detail={status.mode === "EMERGENCY" ? "Emergency intent active" : status.mode === "MANUAL" ? "Time-limited operator lease" : "Policy-selected traffic"} tone={status.mode.toLowerCase()} />
           <SummaryCard label="Controller" value={humanize(status.controller_status)} detail={statusQuery.isError ? "Cached status · reconnecting" : status.physical_state_trust === "CONFIRMED" ? "State confirmed" : `State ${status.physical_state_trust.toLowerCase()}`} tone={statusQuery.isError ? "warning" : status.controller_status.toLowerCase()} />
-            <SummaryCard label="Current stage" value={humanize(status.stage)} detail={status.stage_deadline_at ? `Stage deadline ${formatTime(status.stage_deadline_at)}` : "No active timer"} />
+            <SummaryCard label="Current phase" value={status.phase ? phaseLabel(status.phase) : "No active phase"} detail={humanize(status.stage)} />
             <SummaryCard label="Next phase" value={status.phase_policy.next_phase ? phaseLabel(status.phase_policy.next_phase) : "No queued phase"} detail={status.phase_policy.emergency_phase ? "Selected by emergency priority" : `Policy revision ${status.intent_revision}`} tone={status.phase_policy.emergency_phase ? "emergency" : undefined} />
+            <SummaryCard label="Pending command" value={status.pending_command ? humanize(status.pending_command.status) : "None"} detail={status.pending_command ? `#${status.pending_command.command_id.slice(0, 8)} · ${status.pending_command.deadline_at ? `due ${formatTime(status.pending_command.deadline_at)}` : "awaiting report"}` : "No unconfirmed command"} tone={status.pending_command ? "warning" : undefined} />
           </section>
+
+          {status.emergency_vehicles.length > 0 && <section className="panel emergency-panel" aria-label="Emergency vehicles">
+            <div className="section-heading"><div><p className="eyebrow">EMERGENCY PREEMPTION</p><h2>Priority vehicle detected</h2></div><span className="emergency-badge">EMERGENCY MODE</span></div>
+            <p>Backend transition: <strong>{humanize(status.stage)}</strong>{status.target_phase ? ` · targeting ${phaseLabel(status.target_phase)}` : " · resolving safe transition"}</p>
+            <ul>{status.emergency_vehicles.map((vehicle) => <li key={vehicle.vehicle_id}><strong>{vehicle.vehicle_id}</strong><span>{humanize(vehicle.direction)} · waiting {formatDuration(vehicle.wait_ms)}</span></li>)}</ul>
+          </section>}
 
           <div className="main-grid">
             <div className="primary-column">
@@ -203,20 +217,43 @@ export default function App() {
 
               <SimulatorPanel simulator={simulator} mutationPending={simulatorMutation.isPending} ackDelay={ackDelay} setAckDelay={setAckDelay} onUpdate={(value) => simulatorMutation.mutate(value)} onDelaySubmit={handleDelaySubmit} />
               {simulatorQuery.isError && <p className="inline-error">Simulator controls are unavailable.</p>}
+              <DeviceHealthPanel statuses={status.device_statuses} pending={deviceMutation.isPending} onUpdate={(value) => deviceMutation.mutate({ junctionId: status.junction_id, ...value })} />
+              {deviceMutation.isError && <p className="inline-error">Device status could not be submitted.</p>}
             </aside>
           </div>
         </>
       )}
 
-      {(notice || sensorMutation.isError || manualMutation.isError || simulatorMutation.isError) && (
-        <div className={`toast ${sensorMutation.isError || manualMutation.isError || simulatorMutation.isError ? "toast-error" : ""}`} role="status">
-          {sensorMutation.error?.message ?? manualMutation.error?.message ?? simulatorMutation.error?.message ?? notice}
-          <button type="button" aria-label="Dismiss message" onClick={() => { setNotice(""); sensorMutation.reset(); manualMutation.reset(); simulatorMutation.reset(); }}>×</button>
+      {(notice || sensorMutation.isError || manualMutation.isError || simulatorMutation.isError || deviceMutation.isError) && (
+        <div className={`toast ${sensorMutation.isError || manualMutation.isError || simulatorMutation.isError || deviceMutation.isError ? "toast-error" : ""}`} role="status">
+          {sensorMutation.error?.message ?? manualMutation.error?.message ?? simulatorMutation.error?.message ?? deviceMutation.error?.message ?? notice}
+          <button type="button" aria-label="Dismiss message" onClick={() => { setNotice(""); sensorMutation.reset(); manualMutation.reset(); simulatorMutation.reset(); deviceMutation.reset(); }}>×</button>
         </div>
       )}
       <footer className="page-footer"><span>Simulation only · Controller reports are not proof of physical lamp state.</span><span>Junction A · single-controller demo</span></footer>
     </main>
   );
+}
+
+function DeviceHealthPanel({
+  statuses,
+  pending,
+  onUpdate,
+}: {
+  statuses: JunctionStatus["device_statuses"];
+  pending: boolean;
+  onUpdate: (value: { deviceType: "SENSOR" | "SIGNAL_CONTROLLER"; direction?: Direction; status: "ONLINE" | "OFFLINE" }) => void;
+}) {
+  const [deviceType, setDeviceType] = useState<"SENSOR" | "SIGNAL_CONTROLLER">("SENSOR");
+  const [direction, setDirection] = useState<Direction>("NORTH");
+  const current = statuses.find((device) => device.device_type === deviceType && (deviceType === "SENSOR" || device.direction === direction));
+  const directionOption = deviceType === "SIGNAL_CONTROLLER" ? { direction } : {};
+  return <section className="panel simulation-panel">
+    <div className="section-heading"><div><p className="eyebrow">DEVICE SIMULATOR</p><h2>Sensor & signal health</h2></div><span className="sim-state">{current ? humanize(current.health) : "Unknown"}</span></div>
+    <label className="behavior-label">Device<select value={deviceType} onChange={(event) => setDeviceType(event.target.value === "SIGNAL_CONTROLLER" ? "SIGNAL_CONTROLLER" : "SENSOR")}><option value="SENSOR">Sensor</option><option value="SIGNAL_CONTROLLER">Signal controller</option></select></label>
+    {deviceType === "SIGNAL_CONTROLLER" && <label className="behavior-label">Direction<select value={direction} onChange={(event) => setDirection(parseDirection(event.target.value))}>{DIRECTIONS.map((item) => <option key={item} value={item}>{humanize(item)}</option>)}</select></label>}
+    <div className="device-buttons"><button type="button" disabled={pending || current?.health === "ONLINE"} onClick={() => onUpdate({ deviceType, ...directionOption, status: "ONLINE" })}>Mark online</button><button type="button" disabled={pending || current?.health === "OFFLINE"} onClick={() => onUpdate({ deviceType, ...directionOption, status: "OFFLINE" })}>Mark offline</button></div>
+  </section>;
 }
 
 function SummaryCard({ label, value, detail, tone }: { label: string; value: string; detail: string; tone?: string }) {
@@ -258,7 +295,7 @@ function SimulatorPanel({
       <div className="toggle-row"><div><strong>Automatic ACK</strong><span>Confirm requested vectors automatically</span></div><button className={`toggle ${simulator?.automatic_ack ? "toggle-on" : ""}`} type="button" role="switch" aria-label="Automatic controller acknowledgements" aria-checked={simulator?.automatic_ack ?? false} disabled={!simulator || mutationPending} onClick={() => onUpdate({ automatic_ack: !simulator?.automatic_ack })}><span /></button></div>
       <div className="sim-control-row"><label htmlFor="ack-delay">ACK delay</label><form onSubmit={onDelaySubmit}><input id="ack-delay" type="number" min="0" max="60000" step="250" value={ackDelay ?? simulator?.ack_delay_ms ?? 0} onChange={(event) => setAckDelay(Number(event.target.value))} /><span>ms</span><button type="submit" disabled={!simulator || mutationPending}>Set</button></form></div>
       <label className="behavior-label">Next ACK behavior<select value={simulator?.next_ack_behavior ?? "NORMAL"} disabled={!simulator || mutationPending} onChange={(event) => onUpdate({ next_ack_behavior: parseAckBehavior(event.target.value) })}><option value="NORMAL">Normal</option><option value="DROP">Drop ACK</option><option value="DUPLICATE">Duplicate ACK</option><option value="MISMATCH">Mismatched state</option></select></label>
-      <div className="device-buttons"><button type="button" disabled={!simulator || mutationPending || simulator?.health === "ONLINE"} onClick={() => onUpdate({ health: "ONLINE" })}>Reconnect</button><button type="button" disabled={!simulator || mutationPending || simulator?.health === "OFFLINE"} onClick={() => onUpdate({ health: "OFFLINE" })}>Take offline</button></div>
+      <div className="device-buttons"><button type="button" disabled={!simulator || mutationPending} onClick={() => onUpdate({ health: "ONLINE" })}>Request snapshot</button><button type="button" disabled={!simulator || mutationPending || simulator?.health === "OFFLINE"} onClick={() => onUpdate({ health: "OFFLINE" })}>Take offline</button></div>
     </div>
   </section>;
 }

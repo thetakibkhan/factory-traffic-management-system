@@ -1,6 +1,6 @@
 # Factory Traffic Management Backend
 
-This backend implements the traffic API for the Junction A simulation: PostgreSQL persistence, an ACK-gated safety engine, queue scheduling, emergency/manual intents, a persisted controller simulator/outbox, and idempotent sensor event handling.
+This backend implements the traffic API for the Junction A simulation: PostgreSQL persistence, an ACK-gated safety engine, queue scheduling, emergency/manual intents, a persisted per-junction controller simulator/outbox, and idempotent sensor event handling.
 
 ## Requirements
 
@@ -21,12 +21,14 @@ npm run db:seed
 npm run dev
 ```
 
-Run the domain and application validation tests with `npm test` and type-check/build with `npm run build`.
+Run domain tests, PostgreSQL-backed API integration tests, and type-check/build with `npm test` and `npm run build`. The integration tests use the configured local database and create/delete only a uniquely named `test-...` junction.
 
 The API listens on `PORT` (3000 by default). Available reads:
 
 - `GET /api/health` — checks the database connection.
 - `GET /api/junctions` — lists configured junctions.
+- `GET /api/junctions/:id` — reads a junction's configuration and creation time.
+- `POST /api/junctions` — creates a junction with the standard safe initial configuration and simulator.
 - `GET /api/junctions/:id/status` — returns runtime state and vehicle queue counts.
 - `GET /api/junctions/:id/history?limit=30&cursor=...` — returns newest cause-linked audit records with cursor pagination.
 - `POST /api/sensor-events` — records vehicle arrival and clearance events.
@@ -51,6 +53,8 @@ Example sensor arrival:
 ```
 
 Use `PATCH /api/simulators/A` with `{"next_ack_behavior":"DROP"}`, `DUPLICATE`, or `MISMATCH` to exercise controller failures. `{"health":"OFFLINE"}` takes the simulated controller offline; setting it back to `ONLINE` triggers a fresh snapshot.
+
+`DEVICE_STATUS` controller events accept `device_type: "SENSOR"` or `"SIGNAL_CONTROLLER"`; signal reports also require a direction. Device failures appear in junction status and audit history. An offline signal controller causes lockout until a fresh safe snapshot is accepted.
 
 ## Epics 2–4
 

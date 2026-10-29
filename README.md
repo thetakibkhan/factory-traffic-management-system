@@ -6,8 +6,8 @@ A safety-first factory junction traffic simulation built for the CSI Smart Tech 
 
 - **Epics 1–4:** persistence, Junction A seed, ACK-gated state machine, controller simulator/outbox, and idempotent sensor events.
 - **Epics 5–6:** weighted and starvation-aware scheduling, emergency preemption, manual leases, and audit events.
-- **Epic 7:** live Junction A dashboard with queue scores, controller-reported signal indicators, sensor/manual controls, simulator failure controls, and recent activity.
-- **Epic 8:** run instructions, REST API reference, demo checklist, assumptions, and verification disclosure.
+- **Epic 7:** live Junction A dashboard with queue scores, desired/confirmed signals, current and next phase, pending command, emergency direction and transition, controller/sensor/signal failure controls, manual control, simulation, and recent activity.
+- **Epic 8:** run instructions, REST API reference, demo checklist, assumptions, and verification notes.
 
 See [backend/README.md](backend/README.md), the [API reference](docs/API.md), the [PRD](docs/PRD%20(1).md), and the [decisions log](docs/decisions%20(1).md).
 
@@ -45,7 +45,7 @@ Open the Vite URL printed in the terminal. The frontend proxies `/api` to `http:
 
 From `backend/`, run `npm test` and `npm run build`. From `frontend/`, run `npm run build` to type-check and create the production bundle.
 
-The Epic 5–6 pure domain tests were run with Node's built-in TypeScript stripping because this workspace did not have backend dependencies installed. The complete backend suite, Prisma validation, frontend build, and browser integration scenarios have not been run in this environment.
+The backend suite includes domain, application, and PostgreSQL-backed API integration coverage. Run `npm test` from `backend/` after applying migrations; it creates and removes one randomly named test junction. Run `npm run build` from both `backend/` and `frontend/` for type checking and production builds.
 
 ## Demo checklist
 
@@ -71,9 +71,11 @@ Per-junction serialization is a single-process demo guarantee. The API and simul
 ## Assumptions / Questions / Requirement Issues
 
 - The PRD's example command payload uses a `command` field; this implementation uses the explicit `command_type` field described in its request contract and rejects unknown fields.
+- Junctions created through the API use the same four-direction, two-phase topology and timing as Junction A. A custom conflict graph or per-junction timing editor is not part of the current API.
+- Sensor failures raise a persistent warning and preserve already-recorded queue entries; signal-controller failures lock control until a fresh safe snapshot.
 - Controller ACKs and snapshots are complete signal vectors. They are controller reports, not independent physical-light measurements.
 - Normal green, minimum green, yellow, all-red, ACK timeout, starvation, stale-emergency, and manual lease values are prototype assumptions recorded in the decisions log.
-- Only Junction A is seeded and demonstrated. The system does not provide distributed multi-instance locking.
+- Junction A is seeded and shown in the dashboard. Additional junctions can be created through the API using the standard phase layout and timing. The system does not provide distributed multi-instance locking.
 - The frontend uses polling instead of WebSockets, as selected in the decisions log.
 
 ## AI / Tool Usage
@@ -82,7 +84,6 @@ Codex assisted with implementation, code navigation, and documentation based on 
 
 ## Outstanding work
 
-- Install dependencies and run the full backend suite, Prisma validation, and frontend production build.
-- Exercise the complete dashboard against PostgreSQL and the simulator, including failure and recovery flows.
-- Add browser-level accessibility and interaction checks.
-- Review the audit payloads and dashboard behavior against the final assessment environment.
+- The React dashboard is manually exercised in a browser; a repeatable Playwright suite is not included yet.
+- The REST simulator and controller reports do not verify real signal lamps or industrial hardware safety.
+- Authentication and distributed multi-instance coordination remain outside this assessment scope.

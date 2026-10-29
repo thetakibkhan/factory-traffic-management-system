@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc -p tsconfig.json",
-    "test": "tsx --test src/domain/traffic/engine.test.ts src/domain/traffic/schedulingPolicy.test.ts src/application/perJunctionSerialProcessor.test.ts src/application/sensorEventService.test.ts src/application/controllerEventService.test.ts",
+    "test": "tsx --test src/domain/traffic/engine.test.ts src/domain/traffic/schedulingPolicy.test.ts src/application/perJunctionSerialProcessor.test.ts src/application/sensorEventService.test.ts src/application/controllerEventService.test.ts src/app.integration.test.ts",
     "start": "node dist/index.js",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",

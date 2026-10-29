@@ -29,6 +29,14 @@ const JunctionStatusSchema = z.object({
   manual_lease_expires_at: z.string().nullable(),
   fault_reason: z.string().nullable(),
   controller_status: z.enum(["ONLINE", "OFFLINE", "UNKNOWN"]),
+  device_statuses: z.array(z.object({
+    device_type: z.enum(["CONTROLLER", "SENSOR", "SIGNAL_CONTROLLER"]),
+    direction: DirectionSchema.nullable(),
+    health: z.enum(["ONLINE", "OFFLINE", "UNKNOWN"]),
+    issue_code: z.string().nullable(),
+    last_seen_at: z.string().nullable(),
+  })),
+  emergency_vehicles: z.array(z.object({ vehicle_id: z.string(), direction: DirectionSchema, wait_ms: z.number() })),
   pending_command: z.object({
     command_id: z.string(),
     status: z.string(),
@@ -142,4 +150,24 @@ export function updateSimulator(input: {
   next_ack_behavior?: SimulatorStatus["next_ack_behavior"];
 }): Promise<SimulatorStatus> {
   return requestJson("/simulators/A", SimulatorStatusSchema, { method: "PATCH", body: JSON.stringify(input) });
+}
+
+export async function submitDeviceStatus(input: {
+  junctionId: string;
+  deviceType: "SENSOR" | "SIGNAL_CONTROLLER";
+  direction?: Direction;
+  status: "ONLINE" | "OFFLINE";
+}) {
+  return requestJson("/controller-events", z.object({ accepted: z.boolean() }), {
+    method: "POST",
+    body: JSON.stringify({
+      event_id: crypto.randomUUID(),
+      junction_id: input.junctionId,
+      event_type: "DEVICE_STATUS",
+      device_type: input.deviceType,
+      ...(input.direction === undefined ? {} : { direction: input.direction }),
+      status: input.status,
+      timestamp: new Date().toISOString(),
+    }),
+  });
 }

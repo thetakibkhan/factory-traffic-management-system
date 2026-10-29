@@ -156,7 +156,7 @@ export function acknowledgeCommand(
     return lockout({ ...state, actualSignals, actualObservedAt: now, stateTrust: "MISMATCH" }, "Controller ACK did not match the requested signal vector");
   }
 
-  const observed = {
+  const observed: TrafficState = {
     ...state,
     actualSignals,
     actualObservedAt: now,

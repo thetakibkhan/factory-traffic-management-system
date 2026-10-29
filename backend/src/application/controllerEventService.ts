@@ -38,8 +38,13 @@ const ControllerEventSchema = z.discriminatedUnion("event_type", [
   }).strict(),
   ControllerEventBaseSchema.extend({
     event_type: z.literal("DEVICE_STATUS"),
+    device_type: z.enum(["CONTROLLER", "SENSOR", "SIGNAL_CONTROLLER"]).default("CONTROLLER"),
+    direction: z.enum(["NORTH", "SOUTH", "EAST", "WEST"]).optional(),
     status: z.enum(["ONLINE", "OFFLINE"]),
-  }).strict(),
+  }).strict().refine((event) => event.device_type !== "SIGNAL_CONTROLLER" || event.direction !== undefined, {
+    message: "Signal controller status requires a direction",
+    path: ["direction"],
+  }),
 ]);
 
 export type ControllerEventInput = z.infer<typeof ControllerEventSchema>;
@@ -167,8 +172,11 @@ export class ControllerEventService {
           outcome = snapshot.outcome;
           dispatchCommand = snapshot.command;
         }
-      } else if (input.status === "OFFLINE") {
+      } else if (input.device_type === "CONTROLLER" && input.status === "OFFLINE") {
         nextState = markUnknown(state, "Controller reported OFFLINE");
+        outcome = "LOCKED";
+      } else if (input.device_type === "SIGNAL_CONTROLLER" && input.status === "OFFLINE") {
+        nextState = markUnknown(state, `Signal controller ${input.direction} reported OFFLINE`);
         outcome = "LOCKED";
       }
 
@@ -186,7 +194,11 @@ export class ControllerEventService {
         },
       });
 
-      await updateControllerDeviceStatus(transaction, input.junction_id, simulatorStatus ?? "ONLINE", now);
+      if (input.event_type === "DEVICE_STATUS") {
+        await upsertDeviceStatus(transaction, input.junction_id, input.device_type, input.direction ?? null, input.status, now);
+      } else {
+        await upsertDeviceStatus(transaction, input.junction_id, "CONTROLLER", null, "ONLINE", now);
+      }
 
       const updateResult = await transaction.junctionRuntime.updateMany({
         where: { junctionId: input.junction_id, version: runtime.version },
@@ -203,7 +215,7 @@ export class ControllerEventService {
           stageStartedAt: nextState.stageStartedAt === null ? null : new Date(nextState.stageStartedAt),
           stageDeadlineAt: nextState.stageDeadlineAt === null ? null : new Date(nextState.stageDeadlineAt),
           faultReason: nextState.faultReason,
-          controllerHealth: input.event_type === "DEVICE_STATUS"
+          controllerHealth: input.event_type === "DEVICE_STATUS" && input.device_type === "CONTROLLER"
             ? input.status
             : input.event_type === "STATE_SNAPSHOT" || input.event_type === "COMMAND_ACK" ? "ONLINE" : runtime.controllerHealth,
         },
@@ -232,6 +244,9 @@ export class ControllerEventService {
             event_id: input.event_id,
             event_type: input.event_type,
             command_id: input.event_type === "COMMAND_ACK" ? input.command_id : null,
+            device_type: input.event_type === "DEVICE_STATUS" ? input.device_type : null,
+            direction: input.event_type === "DEVICE_STATUS" ? input.direction ?? null : null,
+            reported_status: input.event_type === "DEVICE_STATUS" ? input.status : null,
             outcome,
             prior_stage: state.stage,
             next_stage: nextState.stage,
@@ -282,7 +297,7 @@ export class ControllerEventService {
         : intent === "AUTOMATIC" ? null
           : runtime.manualExpiresAt !== null && runtime.manualExpiresAt.getTime() > now ? runtime.manualExpiresAt : null;
       const target = emergencyPhase ?? (activeManual ? requestedManualPhase : automaticPhase);
-      const requestedMode = activeEmergency ? "EMERGENCY" : activeManual ? "MANUAL" : "AUTOMATIC";
+      const requestedMode: TrafficState["mode"] = activeEmergency ? "EMERGENCY" : activeManual ? "MANUAL" : "AUTOMATIC";
       const baseState = { ...state, mode: requestedMode };
       const result: EngineResult = state.pendingCommand !== null
         ? { state: { ...baseState, targetPhase: target }, command: null, outcome: "APPLIED" }
@@ -356,49 +371,51 @@ export class ControllerEventService {
 
   async prepareForStartup(): Promise<void> {
     const runtimes = await this.prisma.junctionRuntime.findMany({ select: { junctionId: true } });
-    for (const runtime of runtimes) {
-      await this.serialProcessor.run(runtime.junctionId, () => this.prisma.$transaction(async (transaction) => {
-        const current = await transaction.junctionRuntime.findUnique({ where: { junctionId: runtime.junctionId } });
-        if (current === null) return;
-        const now = new Date();
-        const update = await transaction.junctionRuntime.updateMany({
-          where: { junctionId: current.junctionId, version: current.version },
-          data: {
-            mode: "DEGRADED",
-            stage: "STARTUP_RECONCILIATION",
-            phase: null,
-            version: current.version + 1,
-            stateTrust: current.actualSignals === null ? "UNKNOWN" : "STALE",
-            actualObservedAt: null,
-            stageStartedAt: null,
-            stageDeadlineAt: null,
-            faultReason: "Process restarted; awaiting a fresh controller snapshot",
-            controllerHealth: "UNKNOWN",
-          },
-        });
-        if (update.count !== 1) return;
+    for (const runtime of runtimes) await this.prepareJunctionForStartup(runtime.junctionId);
+  }
 
-        const pendingCommands = await transaction.controllerCommand.findMany({
-          where: { junctionId: current.junctionId, status: { in: ["PENDING", "SENT"] } },
-          select: { commandId: true },
-        });
-        await transaction.controllerCommand.updateMany({
-          where: { junctionId: current.junctionId, status: { in: ["PENDING", "SENT"] } },
-          data: { status: "FAILED" },
-        });
-        await transaction.auditEvent.create({
-          data: {
-            junctionId: current.junctionId,
-            kind: "STARTUP_RECONCILIATION_REQUIRED",
-            payload: {
-              failed_pending_commands: pendingCommands.map((command) => command.commandId),
-              prior_actual_state_trust: current.stateTrust,
-            },
-            occurredAt: now,
+  async prepareJunctionForStartup(junctionId: string): Promise<void> {
+    await this.serialProcessor.run(junctionId, () => this.prisma.$transaction(async (transaction) => {
+      const current = await transaction.junctionRuntime.findUnique({ where: { junctionId } });
+      if (current === null) return;
+      const now = new Date();
+      const update = await transaction.junctionRuntime.updateMany({
+        where: { junctionId: current.junctionId, version: current.version },
+        data: {
+          mode: "DEGRADED",
+          stage: "STARTUP_RECONCILIATION",
+          phase: null,
+          version: current.version + 1,
+          stateTrust: current.actualSignals === null ? "UNKNOWN" : "STALE",
+          actualObservedAt: null,
+          stageStartedAt: null,
+          stageDeadlineAt: null,
+          faultReason: "Process restarted; awaiting a fresh controller snapshot",
+          controllerHealth: "UNKNOWN",
+        },
+      });
+      if (update.count !== 1) return;
+
+      const pendingCommands = await transaction.controllerCommand.findMany({
+        where: { junctionId: current.junctionId, status: { in: ["PENDING", "SENT"] } },
+        select: { commandId: true },
+      });
+      await transaction.controllerCommand.updateMany({
+        where: { junctionId: current.junctionId, status: { in: ["PENDING", "SENT"] } },
+        data: { status: "FAILED" },
+      });
+      await transaction.auditEvent.create({
+        data: {
+          junctionId: current.junctionId,
+          kind: "STARTUP_RECONCILIATION_REQUIRED",
+          payload: {
+            failed_pending_commands: pendingCommands.map((command) => command.commandId),
+            prior_actual_state_trust: current.stateTrust,
           },
-        });
-      }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }));
-    }
+          occurredAt: now,
+        },
+      });
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }));
   }
 
   async advanceDue(junctionId: string, now = Date.now()): Promise<SignalCommand | null> {
@@ -657,24 +674,26 @@ function eventError(httpStatus: number, code: string, message: string): Controll
   };
 }
 
-async function updateControllerDeviceStatus(
+async function upsertDeviceStatus(
   transaction: Prisma.TransactionClient,
   junctionId: string,
+  deviceType: "CONTROLLER" | "SENSOR" | "SIGNAL_CONTROLLER",
+  direction: string | null,
   health: "ONLINE" | "OFFLINE",
   now: Date,
 ): Promise<void> {
   const current = await transaction.deviceStatus.findFirst({
-    where: { junctionId, deviceType: "CONTROLLER", direction: null },
+    where: { junctionId, deviceType, direction },
     select: { id: true },
   });
   if (current === null) {
     await transaction.deviceStatus.create({
-      data: { junctionId, deviceType: "CONTROLLER", health, lastSeenAt: now },
+      data: { junctionId, deviceType, direction, health, lastSeenAt: now, issueCode: health === "OFFLINE" ? `${deviceType}_OFFLINE` : null },
     });
     return;
   }
   await transaction.deviceStatus.update({
     where: { id: current.id },
-    data: { health, lastSeenAt: now, issueCode: health === "OFFLINE" ? "CONTROLLER_OFFLINE" : null },
+    data: { health, lastSeenAt: now, issueCode: health === "OFFLINE" ? `${deviceType}_OFFLINE` : null },
   });
 }

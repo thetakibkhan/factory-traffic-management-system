@@ -4,7 +4,7 @@ import { ZodError, z } from "zod";
 import { ControllerEventService } from "./application/controllerEventService.js";
 import { PerJunctionSerialProcessor } from "./application/perJunctionSerialProcessor.js";
 import { SensorEventService } from "./application/sensorEventService.js";
-import { DIRECTIONS, phaseForDirection, type Direction } from "./domain/traffic/types.js";
+import { allRedSignals, DEFAULT_JUNCTION_CONFIG, DIRECTIONS, phaseForDirection, type Direction } from "./domain/traffic/types.js";
 import { buildPhaseQueues, chooseAutomaticPhase, chooseEmergencyPhase, isDirection } from "./domain/traffic/schedulingPolicy.js";
 import { SimulatorAdapter } from "./infrastructure/controllers/simulatorAdapter.js";
 import { ControllerScheduler } from "./infrastructure/scheduler/controllerScheduler.js";
@@ -18,6 +18,9 @@ const ManualCommandSchema = z.discriminatedUnion("command_type", [
 const HistoryQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(100).default(50),
   cursor: z.string().trim().min(1).optional(),
+}).strict();
+const JunctionCreateSchema = z.object({
+  id: z.string().trim().min(1).max(64).regex(/^[A-Za-z0-9][A-Za-z0-9_-]*$/),
 }).strict();
 
 interface StatusAlert {
@@ -56,13 +59,79 @@ export function createApplication(prisma: PrismaClient) {
     }
   });
 
+  app.get("/api/junctions/:id", async (request: Request, response: Response) => {
+    try {
+      const junction = await prisma.junction.findUnique({
+        where: { id: getRouteId(request.params.id) },
+        select: { id: true, config: true, createdAt: true },
+      });
+      if (junction === null) {
+        response.status(404).json({ error: { code: "JUNCTION_NOT_FOUND", message: "Junction was not found" } });
+        return;
+      }
+      response.json({ junction_id: junction.id, config: junction.config, created_at: junction.createdAt });
+    } catch {
+      response.status(503).json({ error: { code: "DATABASE_UNAVAILABLE", message: "Junction details are unavailable" } });
+    }
+  });
+
+  app.post("/api/junctions", async (request: JsonRequest, response: Response) => {
+    const parsed = JunctionCreateSchema.safeParse(request.body);
+    if (!parsed.success) {
+      response.status(400).json({ error: { code: "INVALID_JUNCTION", message: "Junction payload is invalid", details: parsed.error.issues } });
+      return;
+    }
+    const { id } = parsed.data;
+    const config = {
+      directions: [...DEFAULT_JUNCTION_CONFIG.directions],
+      phases: {
+        NORTH_SOUTH: [...DEFAULT_JUNCTION_CONFIG.phases.NORTH_SOUTH],
+        EAST_WEST: [...DEFAULT_JUNCTION_CONFIG.phases.EAST_WEST],
+      },
+      timing: {
+        normalGreenSeconds: DEFAULT_JUNCTION_CONFIG.timing.normalGreenMs / 1_000,
+        minimumGreenSeconds: DEFAULT_JUNCTION_CONFIG.timing.minimumGreenMs / 1_000,
+        yellowSeconds: DEFAULT_JUNCTION_CONFIG.timing.yellowMs / 1_000,
+        allRedSeconds: DEFAULT_JUNCTION_CONFIG.timing.allRedMs / 1_000,
+        ackTimeoutSeconds: DEFAULT_JUNCTION_CONFIG.timing.ackTimeoutMs / 1_000,
+      },
+    };
+    try {
+      await prisma.$transaction(async (transaction) => {
+        await transaction.junction.create({
+          data: {
+            id,
+            config,
+            runtime: { create: { mode: "DEGRADED", stage: "STARTUP_RECONCILIATION", desiredSignals: allRedSignals(), stateTrust: "UNKNOWN" } },
+            simulatorState: { create: { actualSignals: allRedSignals(), health: "ONLINE", automaticAck: true, ackDelayMs: 0, nextAckBehavior: "NORMAL" } },
+          },
+        });
+        await transaction.auditEvent.create({ data: { junctionId: id, kind: "JUNCTION_CREATED", payload: { junction_id: id } } });
+      });
+    } catch (error: unknown) {
+      if (isPrismaUniqueConstraintError(error)) {
+        response.status(409).json({ error: { code: "JUNCTION_ALREADY_EXISTS", message: "Junction ID already exists" } });
+        return;
+      }
+      response.status(503).json({ error: { code: "JUNCTION_CREATE_FAILED", message: "Junction could not be created" } });
+      return;
+    }
+    let controllerSync: "CONFIRMED" | "PENDING" = "CONFIRMED";
+    try {
+      await simulator.requestSnapshot(id);
+    } catch {
+      controllerSync = "PENDING";
+    }
+    response.status(201).json({ junction_id: id, config, controller_sync: controllerSync });
+  });
+
   app.post("/api/sensor-events", async (request: JsonRequest, response: Response) => {
     try {
       const event = SensorEventService.parse(request.body);
       const result = await sensorEventService.process(event);
       if (result.httpStatus === 201) {
         const command = await controllerEventService.reevaluatePolicy(event.junction_id);
-        if (command !== null) await simulator.dispatch(command);
+        if (command !== null) await simulator.dispatch(command, event.junction_id);
       }
       response.status(result.httpStatus).json(result.body);
     } catch (error: unknown) {
@@ -83,19 +152,20 @@ export function createApplication(prisma: PrismaClient) {
   app.post("/api/junctions/:id/commands", async (request: JsonRequest, response: Response) => {
     try {
       const commandRequest = ManualCommandSchema.parse(request.body);
-      const junction = await prisma.junction.findUnique({ where: { id: request.params.id }, select: { id: true } });
+      const junctionId = getRouteId(request.params.id);
+      const junction = await prisma.junction.findUnique({ where: { id: junctionId }, select: { id: true } });
       if (junction === null) {
         response.status(404).json({ error: { code: "JUNCTION_NOT_FOUND", message: "Junction was not found" } });
         return;
       }
       const command = commandRequest.command_type === "MANUAL_GREEN_REQUEST"
         ? await controllerEventService.requestIntent(
-          request.params.id,
+          junctionId,
           phaseForDirection(commandRequest.direction),
           "MANUAL",
         )
-        : await controllerEventService.requestIntent(request.params.id, null, "AUTOMATIC");
-      if (command !== null) await simulator.dispatch(command);
+        : await controllerEventService.requestIntent(junctionId, null, "AUTOMATIC");
+      if (command !== null) await simulator.dispatch(command, junctionId);
       response.status(202).json({ accepted: true, command_id: command?.commandId ?? null });
     } catch (error: unknown) {
       if (error instanceof ZodError) {
@@ -110,10 +180,14 @@ export function createApplication(prisma: PrismaClient) {
     try {
       const event = ControllerEventService.parse(request.body);
       const result = await controllerEventService.process(event);
-      if (result.dispatchCommand !== null) await simulator.dispatch(result.dispatchCommand);
+      if (result.dispatchCommand !== null) await simulator.dispatch(result.dispatchCommand, event.junction_id);
+      if (result.httpStatus === 202 && event.event_type === "DEVICE_STATUS" && event.status === "ONLINE"
+        && (event.device_type === "CONTROLLER" || event.device_type === "SIGNAL_CONTROLLER")) {
+        await simulator.requestSnapshot(event.junction_id);
+      }
       if (result.httpStatus === 202 && (event.event_type === "COMMAND_ACK" || event.event_type === "STATE_SNAPSHOT")) {
         const policyCommand = await controllerEventService.reevaluatePolicy(event.junction_id);
-        if (policyCommand !== null) await simulator.dispatch(policyCommand);
+        if (policyCommand !== null) await simulator.dispatch(policyCommand, event.junction_id);
       }
       response.status(result.httpStatus).json(result.body);
     } catch (error: unknown) {
@@ -133,7 +207,7 @@ export function createApplication(prisma: PrismaClient) {
 
   app.get("/api/simulators/:id", async (request: Request, response: Response) => {
     try {
-      const simulatorState = await prisma.controllerSimulatorState.findUnique({ where: { junctionId: request.params.id } });
+      const simulatorState = await prisma.controllerSimulatorState.findUnique({ where: { junctionId: getRouteId(request.params.id) } });
       if (simulatorState === null) {
         response.status(404).json({ error: { code: "SIMULATOR_NOT_FOUND", message: "Controller simulator was not found" } });
         return;
@@ -153,7 +227,7 @@ export function createApplication(prisma: PrismaClient) {
 
   app.patch("/api/simulators/:id", async (request: JsonRequest, response: Response) => {
     try {
-      const result = await simulator.configure(request.params.id, request.body);
+      const result = await simulator.configure(getRouteId(request.params.id), request.body);
       response.status(result.status).json(result.body);
     } catch {
       response.status(503).json({ error: { code: "SIMULATOR_UNAVAILABLE", message: "Simulator settings could not be updated" } });
@@ -167,7 +241,7 @@ export function createApplication(prisma: PrismaClient) {
       return;
     }
     try {
-      const junctionId = request.params.id;
+      const junctionId = getRouteId(request.params.id);
       const junction = await prisma.junction.findUnique({ where: { id: junctionId }, select: { id: true } });
       if (junction === null) {
         response.status(404).json({ error: { code: "JUNCTION_NOT_FOUND", message: "Junction was not found" } });
@@ -205,7 +279,7 @@ export function createApplication(prisma: PrismaClient) {
   });
 
   app.get("/api/junctions/:id/status", async (request: Request, response: Response) => {
-    const junctionId = request.params.id;
+    const junctionId = getRouteId(request.params.id);
     try {
       const junction = await prisma.junction.findUnique({
         where: { id: junctionId },
@@ -216,7 +290,7 @@ export function createApplication(prisma: PrismaClient) {
         return;
       }
 
-      const [queueCounts, waitingRows, directionCursors, pendingCommand] = await Promise.all([
+      const [queueCounts, waitingRows, directionCursors, pendingCommand, deviceStatuses, lastFailedCommand] = await Promise.all([
         Promise.all(DIRECTIONS.map(async (direction): Promise<[Direction, number]> => {
           const count = await prisma.vehicle.count({
             where: { junctionId, direction, status: "WAITING" },
@@ -232,6 +306,12 @@ export function createApplication(prisma: PrismaClient) {
           where: { junctionId, status: { in: ["PENDING", "SENT"] } },
           orderBy: { createdAt: "desc" },
           select: { commandId: true, status: true, desiredSignals: true, attempts: true, deadlineAt: true },
+        }),
+        prisma.deviceStatus.findMany({ where: { junctionId }, orderBy: [{ deviceType: "asc" }, { direction: "asc" }] }),
+        prisma.controllerCommand.findFirst({
+          where: { junctionId, status: { in: ["TIMED_OUT", "FAILED"] } },
+          orderBy: { createdAt: "desc" },
+          select: { commandId: true, status: true },
         }),
       ]);
       const waitingVehicles = waitingRows.flatMap((vehicle) => isDirection(vehicle.direction)
@@ -254,6 +334,31 @@ export function createApplication(prisma: PrismaClient) {
       }
       if (junction.runtime.controllerHealth === "OFFLINE") {
         alerts.push({ code: "CONTROLLER_OFFLINE", severity: "CRITICAL", message: "Controller is offline; signal state is not confirmed" });
+      }
+      if (junction.runtime.actualSignals === null || junction.runtime.stateTrust === "UNKNOWN") {
+        alerts.push({ code: "PHYSICAL_STATE_UNKNOWN", severity: "CRITICAL", message: "The actual signal state has not been confirmed by the controller" });
+      }
+      if (junction.runtime.stateTrust === "STALE") {
+        alerts.push({ code: "CONTROLLER_REPORT_STALE", severity: "WARNING", message: "The last controller report is stale" });
+      }
+      if (junction.runtime.stateTrust === "MISMATCH") {
+        alerts.push({ code: "DESIRED_ACTUAL_MISMATCH", severity: "CRITICAL", message: "Controller-reported signals do not match the requested safe state" });
+      }
+      if (lastFailedCommand !== null && junction.runtime.stage === "FAULT_LOCKOUT") {
+        alerts.push({
+          code: lastFailedCommand.status === "TIMED_OUT" ? "COMMAND_TIMEOUT" : "COMMAND_FAILED",
+          severity: "CRITICAL",
+          message: `Controller command ${lastFailedCommand.commandId} ${lastFailedCommand.status.toLowerCase()}`,
+        });
+      }
+      for (const device of deviceStatuses) {
+        if (device.health !== "OFFLINE" || device.deviceType === "CONTROLLER") continue;
+        const label = device.deviceType === "SIGNAL_CONTROLLER" ? `Signal ${device.direction ?? "device"}` : device.deviceType.toLowerCase();
+        alerts.push({
+          code: device.deviceType === "SIGNAL_CONTROLLER" ? "SIGNAL_OFFLINE" : `${device.deviceType}_OFFLINE`,
+          severity: "CRITICAL",
+          message: `${label} is offline`,
+        });
       }
       for (const vehicle of waitingVehicles) {
         if (vehicle.type === "EMERGENCY" && now - vehicle.arrivedAtServer.getTime() >= 60_000) {
@@ -284,6 +389,20 @@ export function createApplication(prisma: PrismaClient) {
         manual_lease_expires_at: junction.runtime.manualExpiresAt,
         fault_reason: junction.runtime.faultReason,
         controller_status: junction.runtime.controllerHealth,
+        device_statuses: deviceStatuses.map((device) => ({
+          device_type: device.deviceType,
+          direction: device.direction,
+          health: device.health,
+          issue_code: device.issueCode,
+          last_seen_at: device.lastSeenAt,
+        })),
+        emergency_vehicles: waitingVehicles
+          .filter((vehicle) => vehicle.type === "EMERGENCY")
+          .map((vehicle) => ({
+            vehicle_id: vehicle.vehicleId,
+            direction: vehicle.direction,
+            wait_ms: Math.max(0, now - vehicle.arrivedAtServer.getTime()),
+          })),
         pending_command: pendingCommand === null ? null : {
           command_id: pendingCommand.commandId,
           status: pendingCommand.status,
@@ -311,4 +430,12 @@ export function createApplication(prisma: PrismaClient) {
 
 export function createApp(prisma: PrismaClient) {
   return createApplication(prisma).app;
+}
+
+function isPrismaUniqueConstraintError(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "P2002";
+}
+
+function getRouteId(value: string | string[] | undefined): string {
+  return Array.isArray(value) ? value[0] ?? "" : value ?? "";
 }

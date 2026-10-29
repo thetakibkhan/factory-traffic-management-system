@@ -76,6 +76,7 @@ enum ControllerCommandStatus {
 enum DeviceType {
   CONTROLLER
   SENSOR
+  SIGNAL_CONTROLLER
 }
 
 enum DeviceHealth {

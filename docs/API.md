@@ -8,9 +8,12 @@ The API base path is `/api`. JSON request bodies use strict validation. Timestam
 | --- | --- |
 | `GET /api/health` | Database health. |
 | `GET /api/junctions` | Junction IDs and configuration summaries. |
+| `GET /api/junctions/:id` | Junction configuration and creation time. |
 | `GET /api/junctions/:id/status` | Runtime, desired and observed signal vectors, controller trust, queues, sequence cursors, weighted phase scores, next phase, manual lease, pending command, and active alerts. |
 | `GET /api/junctions/:id/history?limit=30&cursor=...` | Newest audit events first. `limit` is 1–100 (default 50); `next_cursor` can be passed as `cursor` to fetch older records. |
 | `GET /api/simulators/:id` | Current simulator state and ACK behavior. |
+
+`POST /api/junctions` creates a junction with the standard four-direction, two-phase configuration, safe all-red desired state, and an online REST simulator. The backend immediately requests a full controller snapshot before traffic can be scheduled. Payload: `{"id":"B"}`. IDs are 1–64 letters, numbers, underscores, or hyphens and must be unique. Creation returns `201`; invalid payloads return `400`; duplicate IDs return `409`.
 
 History responses contain `events` with `id`, `kind`, `correlation_id`, `occurred_at`, and `payload`, plus a nullable `next_cursor`. A cursor must identify an event belonging to the requested junction.
 
@@ -66,4 +69,4 @@ Manual requests renew a 120-second lease. They create target intents; the backen
 
 ## Controller events
 
-`POST /api/controller-events` is used by the simulator and accepts `COMMAND_ACK`, `STATE_SNAPSHOT`, or `DEVICE_STATUS`. ACK and snapshot events include a complete `actual_signals` object with `NORTH`, `SOUTH`, `EAST`, and `WEST` colors. A command ACK also includes `command_id`. Device status includes `status: "ONLINE" | "OFFLINE"`.
+`POST /api/controller-events` is used by the simulator and accepts `COMMAND_ACK`, `STATE_SNAPSHOT`, or `DEVICE_STATUS`. ACK and snapshot events include a complete `actual_signals` object with `NORTH`, `SOUTH`, `EAST`, and `WEST` colors. A command ACK also includes `command_id`. Device status includes `status: "ONLINE" | "OFFLINE"`; `device_type` can be `CONTROLLER`, `SENSOR`, or `SIGNAL_CONTROLLER` (default `CONTROLLER`). A signal controller report must include a direction. Sensor and signal health are persisted, audited, and exposed by the status endpoint. Taking a signal controller offline locks the runtime into degraded/unknown state; reporting it online requests a fresh snapshot before safe operation resumes.

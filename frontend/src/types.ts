@@ -40,6 +40,14 @@ export interface JunctionStatus {
   manual_lease_expires_at: string | null;
   fault_reason: string | null;
   controller_status: "ONLINE" | "OFFLINE" | "UNKNOWN";
+  device_statuses: Array<{
+    device_type: "CONTROLLER" | "SENSOR" | "SIGNAL_CONTROLLER";
+    direction: Direction | null;
+    health: "ONLINE" | "OFFLINE" | "UNKNOWN";
+    issue_code: string | null;
+    last_seen_at: string | null;
+  }>;
+  emergency_vehicles: Array<{ vehicle_id: string; direction: Direction; wait_ms: number }>;
   pending_command: null | {
     command_id: string;
     status: string;
