@@ -1,0 +1,256 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum RuntimeMode {
+  AUTOMATIC
+  MANUAL
+  EMERGENCY
+  DEGRADED
+}
+
+enum RuntimeStage {
+  STARTUP_RECONCILIATION
+  ALL_RED
+  NORTH_SOUTH_GREEN
+  NORTH_SOUTH_YELLOW
+  EAST_WEST_GREEN
+  EAST_WEST_YELLOW
+  FAULT_LOCKOUT
+}
+
+enum TrafficPhase {
+  NORTH_SOUTH
+  EAST_WEST
+}
+
+enum StateTrust {
+  CONFIRMED
+  STALE
+  UNKNOWN
+  MISMATCH
+}
+
+enum SignalColor {
+  RED
+  YELLOW
+  GREEN
+}
+
+enum VehicleType {
+  EMERGENCY
+  TRUCK
+  FORKLIFT
+  EMPLOYEE_VEHICLE
+}
+
+enum VehicleStatus {
+  WAITING
+  CLEARED
+}
+
+enum SensorEventType {
+  VEHICLE_ARRIVED
+  VEHICLE_CLEARED
+}
+
+enum EventResult {
+  ACCEPTED
+  DUPLICATE
+  REJECTED
+}
+
+enum ControllerCommandStatus {
+  PENDING
+  SENT
+  ACKNOWLEDGED
+  TIMED_OUT
+  FAILED
+}
+
+enum DeviceType {
+  CONTROLLER
+  SENSOR
+}
+
+enum DeviceHealth {
+  ONLINE
+  OFFLINE
+  UNKNOWN
+}
+
+enum SimulatorAckBehavior {
+  NORMAL
+  DROP
+  DUPLICATE
+  MISMATCH
+}
+
+model Junction {
+  id          String            @id
+  config      Json
+  createdAt   DateTime          @default(now()) @map("created_at")
+  runtime     JunctionRuntime?
+  vehicles    Vehicle[]
+  sensorEvents SensorEvent[]
+  directionCursors DirectionCursor[]
+  commands    ControllerCommand[]
+  controllerEvents ControllerEvent[]
+  simulatorState ControllerSimulatorState?
+  auditEvents AuditEvent[]
+  deviceStatuses DeviceStatus[]
+
+  @@map("junctions")
+}
+
+model JunctionRuntime {
+  junctionId       String       @id @map("junction_id")
+  mode             RuntimeMode  @default(DEGRADED)
+  stage            RuntimeStage @default(STARTUP_RECONCILIATION)
+  phase            TrafficPhase?
+  targetPhase      TrafficPhase? @map("target_phase")
+  manualPhase      TrafficPhase? @map("manual_phase")
+  intentRevision   Int          @default(0) @map("intent_revision")
+  version          Int          @default(0)
+  desiredSignals   Json         @map("desired_signals")
+  actualSignals    Json?        @map("actual_signals")
+  stateTrust       StateTrust   @default(UNKNOWN) @map("state_trust")
+  actualObservedAt DateTime?    @map("actual_observed_at")
+  stageStartedAt   DateTime?    @map("stage_started_at")
+  stageDeadlineAt  DateTime?    @map("stage_deadline_at")
+  manualExpiresAt  DateTime?    @map("manual_expires_at")
+  faultReason      String?      @map("fault_reason")
+  controllerHealth DeviceHealth @default(UNKNOWN) @map("controller_health")
+  junction         Junction    @relation(fields: [junctionId], references: [id], onDelete: Cascade)
+
+  @@map("junction_runtime")
+}
+
+model Vehicle {
+  id               String        @id @default(cuid())
+  junctionId       String        @map("junction_id")
+  vehicleId        String        @map("vehicle_id")
+  arrivalEventId   String        @map("arrival_event_id")
+  direction        String
+  type             VehicleType
+  status           VehicleStatus @default(WAITING)
+  arrivedAtServer  DateTime      @map("arrived_at_server")
+  clearedAtServer  DateTime?     @map("cleared_at_server")
+  junction         Junction      @relation(fields: [junctionId], references: [id], onDelete: Cascade)
+
+  @@index([junctionId, status, direction])
+  @@index([junctionId, vehicleId, status])
+  @@index([type, status, arrivedAtServer])
+  @@map("vehicles")
+}
+
+model SensorEvent {
+  id                 String          @id @default(cuid())
+  junctionId         String          @map("junction_id")
+  eventId            String          @map("event_id")
+  payloadHash        String          @map("payload_hash")
+  direction          String
+  vehicleId          String          @map("vehicle_id")
+  vehicleType        VehicleType?    @map("vehicle_type")
+  sequenceNo         Int             @map("sequence_no")
+  eventType          SensorEventType @map("event_type")
+  sensorTimestamp    DateTime        @map("sensor_timestamp")
+  receivedAt         DateTime        @default(now()) @map("received_at")
+  result             EventResult
+  rejectionCode      String?         @map("rejection_code")
+  junction           Junction        @relation(fields: [junctionId], references: [id], onDelete: Cascade)
+
+  @@unique([junctionId, eventId])
+  @@index([junctionId, direction, sequenceNo])
+  @@map("sensor_events")
+}
+
+model DirectionCursor {
+  junctionId String @map("junction_id")
+  direction  String
+  lastSequence Int @map("last_sequence")
+  junction Junction @relation(fields: [junctionId], references: [id], onDelete: Cascade)
+
+  @@id([junctionId, direction])
+  @@map("direction_cursors")
+}
+
+model ControllerCommand {
+  commandId      String                 @id @map("command_id")
+  junctionId     String                 @map("junction_id")
+  desiredSignals Json                   @map("desired_signals")
+  runtimeVersion Int                    @map("runtime_version")
+  status         ControllerCommandStatus @default(PENDING)
+  attempts       Int                    @default(0)
+  deadlineAt     DateTime?              @map("deadline_at")
+  createdAt      DateTime               @default(now()) @map("created_at")
+  sentAt         DateTime?              @map("sent_at")
+  acknowledgedAt DateTime?              @map("acknowledged_at")
+  junction       Junction               @relation(fields: [junctionId], references: [id], onDelete: Cascade)
+  events         ControllerEvent[]
+
+  @@index([junctionId, status])
+  @@map("controller_commands")
+}
+
+model ControllerEvent {
+  id             String             @id @default(cuid())
+  eventId        String             @unique @map("event_id")
+  junctionId     String             @map("junction_id")
+  commandId      String?            @map("command_id")
+  payloadHash    String             @map("payload_hash")
+  reportedSignals Json?             @map("reported_signals")
+  status         String
+  reportedAt     DateTime           @map("reported_at")
+  receivedAt     DateTime           @default(now()) @map("received_at")
+  junction       Junction           @relation(fields: [junctionId], references: [id], onDelete: Cascade)
+  command        ControllerCommand? @relation(fields: [commandId], references: [commandId], onDelete: SetNull)
+
+  @@index([junctionId, receivedAt])
+  @@map("controller_events")
+}
+
+model ControllerSimulatorState {
+  junctionId       String               @id @map("junction_id")
+  actualSignals    Json                 @map("actual_signals")
+  health           DeviceHealth         @default(ONLINE)
+  automaticAck     Boolean              @default(true) @map("automatic_ack")
+  ackDelayMs       Int                  @default(0) @map("ack_delay_ms")
+  nextAckBehavior  SimulatorAckBehavior @default(NORMAL) @map("next_ack_behavior")
+  updatedAt        DateTime             @updatedAt @map("updated_at")
+  junction         Junction             @relation(fields: [junctionId], references: [id], onDelete: Cascade)
+
+  @@map("controller_simulator_states")
+}
+
+model AuditEvent {
+  id             String   @id @default(cuid())
+  junctionId     String   @map("junction_id")
+  kind           String
+  payload        Json
+  correlationId  String?  @map("correlation_id")
+  occurredAt     DateTime @default(now()) @map("occurred_at")
+  junction       Junction @relation(fields: [junctionId], references: [id], onDelete: Cascade)
+
+  @@index([junctionId, occurredAt])
+  @@map("audit_events")
+}
+
+model DeviceStatus {
+  id         String      @id @default(cuid())
+  junctionId String      @map("junction_id")
+  deviceType DeviceType  @map("device_type")
+  direction  String?
+  health     DeviceHealth
+  issueCode  String?     @map("issue_code")
+  lastSeenAt DateTime?   @map("last_seen_at")
+  junction   Junction    @relation(fields: [junctionId], references: [id], onDelete: Cascade)
+
+  @@index([junctionId, deviceType, direction])
+  @@map("device_statuses")
+}

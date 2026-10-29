@@ -1,0 +1,314 @@
+import express, { type Request, type Response } from "express";
+import { PrismaClient } from "@prisma/client";
+import { ZodError, z } from "zod";
+import { ControllerEventService } from "./application/controllerEventService.js";
+import { PerJunctionSerialProcessor } from "./application/perJunctionSerialProcessor.js";
+import { SensorEventService } from "./application/sensorEventService.js";
+import { DIRECTIONS, phaseForDirection, type Direction } from "./domain/traffic/types.js";
+import { buildPhaseQueues, chooseAutomaticPhase, chooseEmergencyPhase, isDirection } from "./domain/traffic/schedulingPolicy.js";
+import { SimulatorAdapter } from "./infrastructure/controllers/simulatorAdapter.js";
+import { ControllerScheduler } from "./infrastructure/scheduler/controllerScheduler.js";
+
+type JsonRequest = Request<Record<string, string>, unknown, unknown>;
+
+const ManualCommandSchema = z.discriminatedUnion("command_type", [
+  z.object({ command_type: z.literal("MANUAL_GREEN_REQUEST"), direction: z.enum(["NORTH", "SOUTH", "EAST", "WEST"]) }).strict(),
+  z.object({ command_type: z.literal("RETURN_TO_AUTOMATIC") }).strict(),
+]);
+const HistoryQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(100).default(50),
+  cursor: z.string().trim().min(1).optional(),
+}).strict();
+
+interface StatusAlert {
+  code: string;
+  severity: "WARNING" | "CRITICAL";
+  message: string;
+}
+
+export function createApplication(prisma: PrismaClient) {
+  const app = express();
+  app.use(express.json({ limit: "16kb" }));
+  const serialProcessor = new PerJunctionSerialProcessor();
+  const sensorEventService = new SensorEventService(prisma, serialProcessor);
+  const controllerEventService = new ControllerEventService(prisma, serialProcessor);
+  const simulator = new SimulatorAdapter(prisma, controllerEventService);
+  const scheduler = new ControllerScheduler(prisma, controllerEventService, simulator);
+
+  app.get("/api/health", async (_request: Request, response: Response) => {
+    try {
+      await prisma.$queryRaw`SELECT 1`;
+      response.json({ status: "ok", database: "connected" });
+    } catch {
+      response.status(503).json({ status: "unavailable", database: "disconnected" });
+    }
+  });
+
+  app.get("/api/junctions", async (_request: Request, response: Response) => {
+    try {
+      const junctions = await prisma.junction.findMany({
+        select: { id: true, config: true, createdAt: true },
+        orderBy: { id: "asc" },
+      });
+      response.json({ junctions });
+    } catch {
+      response.status(503).json({ error: { code: "DATABASE_UNAVAILABLE", message: "Junction status is unavailable" } });
+    }
+  });
+
+  app.post("/api/sensor-events", async (request: JsonRequest, response: Response) => {
+    try {
+      const event = SensorEventService.parse(request.body);
+      const result = await sensorEventService.process(event);
+      if (result.httpStatus === 201) {
+        const command = await controllerEventService.reevaluatePolicy(event.junction_id);
+        if (command !== null) await simulator.dispatch(command);
+      }
+      response.status(result.httpStatus).json(result.body);
+    } catch (error: unknown) {
+      if (error instanceof ZodError) {
+        response.status(400).json({
+          error: {
+            code: "INVALID_SENSOR_EVENT",
+            message: "Sensor event payload is invalid",
+            details: error.issues,
+          },
+        });
+        return;
+      }
+      response.status(500).json({ error: { code: "INTERNAL_ERROR", message: "Sensor event could not be processed" } });
+    }
+  });
+
+  app.post("/api/junctions/:id/commands", async (request: JsonRequest, response: Response) => {
+    try {
+      const commandRequest = ManualCommandSchema.parse(request.body);
+      const junction = await prisma.junction.findUnique({ where: { id: request.params.id }, select: { id: true } });
+      if (junction === null) {
+        response.status(404).json({ error: { code: "JUNCTION_NOT_FOUND", message: "Junction was not found" } });
+        return;
+      }
+      const command = commandRequest.command_type === "MANUAL_GREEN_REQUEST"
+        ? await controllerEventService.requestIntent(
+          request.params.id,
+          phaseForDirection(commandRequest.direction),
+          "MANUAL",
+        )
+        : await controllerEventService.requestIntent(request.params.id, null, "AUTOMATIC");
+      if (command !== null) await simulator.dispatch(command);
+      response.status(202).json({ accepted: true, command_id: command?.commandId ?? null });
+    } catch (error: unknown) {
+      if (error instanceof ZodError) {
+        response.status(400).json({ error: { code: "INVALID_COMMAND", message: "Command payload is invalid", details: error.issues } });
+        return;
+      }
+      response.status(500).json({ error: { code: "COMMAND_FAILED", message: "Command could not be processed" } });
+    }
+  });
+
+  app.post("/api/controller-events", async (request: JsonRequest, response: Response) => {
+    try {
+      const event = ControllerEventService.parse(request.body);
+      const result = await controllerEventService.process(event);
+      if (result.dispatchCommand !== null) await simulator.dispatch(result.dispatchCommand);
+      if (result.httpStatus === 202 && (event.event_type === "COMMAND_ACK" || event.event_type === "STATE_SNAPSHOT")) {
+        const policyCommand = await controllerEventService.reevaluatePolicy(event.junction_id);
+        if (policyCommand !== null) await simulator.dispatch(policyCommand);
+      }
+      response.status(result.httpStatus).json(result.body);
+    } catch (error: unknown) {
+      if (error instanceof ZodError) {
+        response.status(400).json({
+          error: {
+            code: "INVALID_CONTROLLER_EVENT",
+            message: "Controller event payload is invalid",
+            details: error.issues,
+          },
+        });
+        return;
+      }
+      response.status(500).json({ error: { code: "INTERNAL_ERROR", message: "Controller event could not be processed" } });
+    }
+  });
+
+  app.get("/api/simulators/:id", async (request: Request, response: Response) => {
+    try {
+      const simulatorState = await prisma.controllerSimulatorState.findUnique({ where: { junctionId: request.params.id } });
+      if (simulatorState === null) {
+        response.status(404).json({ error: { code: "SIMULATOR_NOT_FOUND", message: "Controller simulator was not found" } });
+        return;
+      }
+      response.json({
+        junction_id: simulatorState.junctionId,
+        health: simulatorState.health,
+        automatic_ack: simulatorState.automaticAck,
+        ack_delay_ms: simulatorState.ackDelayMs,
+        next_ack_behavior: simulatorState.nextAckBehavior,
+        actual_signals: simulatorState.actualSignals,
+      });
+    } catch {
+      response.status(503).json({ error: { code: "DATABASE_UNAVAILABLE", message: "Simulator state is unavailable" } });
+    }
+  });
+
+  app.patch("/api/simulators/:id", async (request: JsonRequest, response: Response) => {
+    try {
+      const result = await simulator.configure(request.params.id, request.body);
+      response.status(result.status).json(result.body);
+    } catch {
+      response.status(503).json({ error: { code: "SIMULATOR_UNAVAILABLE", message: "Simulator settings could not be updated" } });
+    }
+  });
+
+  app.get("/api/junctions/:id/history", async (request: Request, response: Response) => {
+    const parsedQuery = HistoryQuerySchema.safeParse(request.query);
+    if (!parsedQuery.success) {
+      response.status(400).json({ error: { code: "INVALID_HISTORY_QUERY", message: "History query is invalid", details: parsedQuery.error.issues } });
+      return;
+    }
+    try {
+      const junctionId = request.params.id;
+      const junction = await prisma.junction.findUnique({ where: { id: junctionId }, select: { id: true } });
+      if (junction === null) {
+        response.status(404).json({ error: { code: "JUNCTION_NOT_FOUND", message: "Junction was not found" } });
+        return;
+      }
+      const cursor = parsedQuery.data.cursor === undefined ? null : await prisma.auditEvent.findFirst({
+        where: { id: parsedQuery.data.cursor, junctionId },
+        select: { id: true },
+      });
+      if (parsedQuery.data.cursor !== undefined && cursor === null) {
+        response.status(400).json({ error: { code: "INVALID_HISTORY_CURSOR", message: "History cursor was not found for this junction" } });
+        return;
+      }
+      const rows = await prisma.auditEvent.findMany({
+        where: { junctionId },
+        orderBy: [{ occurredAt: "desc" }, { id: "desc" }],
+        take: parsedQuery.data.limit + 1,
+        ...(cursor === null ? {} : { cursor: { id: cursor.id }, skip: 1 }),
+      });
+      const hasMore = rows.length > parsedQuery.data.limit;
+      const events = rows.slice(0, parsedQuery.data.limit);
+      response.json({
+        events: events.map((event) => ({
+          id: event.id,
+          kind: event.kind,
+          correlation_id: event.correlationId,
+          occurred_at: event.occurredAt,
+          payload: event.payload,
+        })),
+        next_cursor: hasMore ? events.at(-1)?.id ?? null : null,
+      });
+    } catch {
+      response.status(503).json({ error: { code: "DATABASE_UNAVAILABLE", message: "Junction history is unavailable" } });
+    }
+  });
+
+  app.get("/api/junctions/:id/status", async (request: Request, response: Response) => {
+    const junctionId = request.params.id;
+    try {
+      const junction = await prisma.junction.findUnique({
+        where: { id: junctionId },
+        include: { runtime: true },
+      });
+      if (junction === null || junction.runtime === null) {
+        response.status(404).json({ error: { code: "JUNCTION_NOT_FOUND", message: "Junction was not found" } });
+        return;
+      }
+
+      const [queueCounts, waitingRows, directionCursors, pendingCommand] = await Promise.all([
+        Promise.all(DIRECTIONS.map(async (direction): Promise<[Direction, number]> => {
+          const count = await prisma.vehicle.count({
+            where: { junctionId, direction, status: "WAITING" },
+          });
+          return [direction, count];
+        })),
+        prisma.vehicle.findMany({
+          where: { junctionId, status: "WAITING" },
+          select: { direction: true, type: true, arrivedAtServer: true, vehicleId: true, arrivalEventId: true },
+        }),
+        prisma.directionCursor.findMany({ where: { junctionId }, select: { direction: true, lastSequence: true } }),
+        prisma.controllerCommand.findFirst({
+          where: { junctionId, status: { in: ["PENDING", "SENT"] } },
+          orderBy: { createdAt: "desc" },
+          select: { commandId: true, status: true, desiredSignals: true, attempts: true, deadlineAt: true },
+        }),
+      ]);
+      const waitingVehicles = waitingRows.flatMap((vehicle) => isDirection(vehicle.direction)
+        ? [{ direction: vehicle.direction, type: vehicle.type, arrivedAtServer: vehicle.arrivedAtServer, vehicleId: vehicle.vehicleId, eventId: vehicle.arrivalEventId }]
+        : []);
+      const sequenceCursors: Record<Direction, number> = { NORTH: 0, SOUTH: 0, EAST: 0, WEST: 0 };
+      for (const cursor of directionCursors) {
+        if (isDirection(cursor.direction)) sequenceCursors[cursor.direction] = cursor.lastSequence;
+      }
+      const phaseQueues = buildPhaseQueues(waitingVehicles.filter((vehicle) => vehicle.type !== "EMERGENCY"), Date.now());
+      const emergencyPhase = chooseEmergencyPhase(waitingVehicles);
+      const manualLeaseIsActive = junction.runtime.manualExpiresAt !== null
+        && junction.runtime.manualExpiresAt.getTime() > Date.now();
+      const nextPhase = emergencyPhase
+        ?? (manualLeaseIsActive ? junction.runtime.manualPhase : chooseAutomaticPhase(phaseQueues, junction.runtime.phase));
+      const now = Date.now();
+      const alerts: StatusAlert[] = [];
+      if (junction.runtime.stage === "FAULT_LOCKOUT") {
+        alerts.push({ code: "FAULT_LOCKOUT", severity: "CRITICAL", message: junction.runtime.faultReason ?? "Controller state is locked out" });
+      }
+      if (junction.runtime.controllerHealth === "OFFLINE") {
+        alerts.push({ code: "CONTROLLER_OFFLINE", severity: "CRITICAL", message: "Controller is offline; signal state is not confirmed" });
+      }
+      for (const vehicle of waitingVehicles) {
+        if (vehicle.type === "EMERGENCY" && now - vehicle.arrivedAtServer.getTime() >= 60_000) {
+          alerts.push({ code: "EMERGENCY_STALE", severity: "CRITICAL", message: `Emergency vehicle ${vehicle.vehicleId} has waited over 60 seconds` });
+        }
+      }
+      for (const [phase, queue] of Object.entries(phaseQueues)) {
+        if (queue.count > 0 && queue.oldestWaitMs >= 90_000) {
+          alerts.push({ code: "NORMAL_TRAFFIC_STARVATION", severity: "WARNING", message: `${phase.replace("_", "/")} queue has waited over 90 seconds` });
+        }
+      }
+
+      response.json({
+        junction_id: junctionId,
+        mode: junction.runtime.mode,
+        stage: junction.runtime.stage,
+        phase: junction.runtime.phase,
+        target_phase: junction.runtime.targetPhase,
+        manual_phase: junction.runtime.manualPhase,
+        intent_revision: junction.runtime.intentRevision,
+        version: junction.runtime.version,
+        desired_signals: junction.runtime.desiredSignals,
+        actual_signals: junction.runtime.actualSignals,
+        physical_state_trust: junction.runtime.stateTrust,
+        actual_observed_at: junction.runtime.actualObservedAt,
+        stage_started_at: junction.runtime.stageStartedAt,
+        stage_deadline_at: junction.runtime.stageDeadlineAt,
+        manual_lease_expires_at: junction.runtime.manualExpiresAt,
+        fault_reason: junction.runtime.faultReason,
+        controller_status: junction.runtime.controllerHealth,
+        pending_command: pendingCommand === null ? null : {
+          command_id: pendingCommand.commandId,
+          status: pendingCommand.status,
+          desired_signals: pendingCommand.desiredSignals,
+          attempts: pendingCommand.attempts,
+          deadline_at: pendingCommand.deadlineAt,
+        },
+        queues: Object.fromEntries(queueCounts),
+        sequence_cursors: sequenceCursors,
+        phase_policy: {
+          weights: { EMPLOYEE_VEHICLE: 1, FORKLIFT: 2, TRUCK: 4 },
+          phases: phaseQueues,
+          emergency_phase: emergencyPhase,
+          next_phase: nextPhase,
+        },
+        alerts,
+      });
+    } catch {
+      response.status(503).json({ error: { code: "DATABASE_UNAVAILABLE", message: "Junction status is unavailable" } });
+    }
+  });
+
+  return { app, controllerScheduler: scheduler };
+}
+
+export function createApp(prisma: PrismaClient) {
+  return createApplication(prisma).app;
+}
