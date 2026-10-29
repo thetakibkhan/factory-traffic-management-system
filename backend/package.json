@@ -1,5 +1,6 @@
 {
   "name": "factory-traffic-management-backend",
+  "description": "REST API and traffic-control services for the Factory Traffic Management System.",
   "version": "0.1.0",
   "private": true,
   "type": "module",
