@@ -96,7 +96,11 @@ export default function App() {
           </div>
         </div>
         <div className="topbar-meta">
-          <span className="junction-tag"><span className="pulse-dot" /> Junction A</span>
+          <span className={`connection-tag ${statusQuery.isPending ? "connection-pending" : statusQuery.isError ? "connection-offline" : "connection-online"}`} role="status">
+            <span className="pulse-dot" aria-hidden="true" />
+            {statusQuery.isPending ? "Connecting" : statusQuery.isError ? "API offline" : "API connected"}
+          </span>
+          <span className="junction-tag">Junction A</span>
           <span className="updated-at">{status?.actual_observed_at ? `${statusQuery.isError ? "Cached report" : "Last controller report"} ${formatTime(status.actual_observed_at)}` : "Waiting for controller report"}</span>
         </div>
       </header>
